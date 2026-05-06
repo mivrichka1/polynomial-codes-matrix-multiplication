@@ -1,0 +1,197 @@
+"""Distributed matrix multiplication with polynomial codes.
+
+This script models a simple version of coded distributed matrix multiplication.
+
+We split matrices A and B into blocks:
+    A = [A0 A1]
+    B = [B0; B1]
+
+Then:
+    A(x) = A0 + A1 x
+    B(x) = B0 + B1 x
+
+Workers compute:
+    C(x_i) = A(x_i) B(x_i)
+
+The target product is:
+    AB = A0 B0 + A1 B1
+
+Since C(x) is a degree-2 matrix-valued polynomial, we can interpolate it
+from 3 worker results and recover the coefficient of x^0 and x^2.
+
+This is a compact educational example with straggler simulation.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+@dataclass
+class WorkerResult:
+    """Result returned by a simulated worker."""
+
+    point: float
+    value: np.ndarray
+    delay: float
+    is_straggler: bool
+
+
+def split_matrices(
+    a_matrix: np.ndarray,
+    b_matrix: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split A by columns and B by rows into two compatible blocks."""
+    if a_matrix.shape[1] != b_matrix.shape[0]:
+        raise ValueError("Incompatible matrix shapes for multiplication.")
+
+    middle = a_matrix.shape[1] // 2
+    if middle == 0:
+        raise ValueError("Matrices are too small for two-block splitting.")
+
+    a0 = a_matrix[:, :middle]
+    a1 = a_matrix[:, middle:]
+    b0 = b_matrix[:middle, :]
+    b1 = b_matrix[middle:, :]
+
+    if a0.shape[1] != a1.shape[1]:
+        raise ValueError("The inner dimension must be even for this demo.")
+
+    return a0, a1, b0, b1
+
+
+def encode_a(a0: np.ndarray, a1: np.ndarray, x_value: float) -> np.ndarray:
+    """Evaluate A(x) = A0 + A1*x."""
+    return a0 + a1 * x_value
+
+
+def encode_b(b0: np.ndarray, b1: np.ndarray, x_value: float) -> np.ndarray:
+    """Evaluate B(x) = B0 + B1*x."""
+    return b0 + b1 * x_value
+
+
+def worker_compute(
+    a0: np.ndarray,
+    a1: np.ndarray,
+    b0: np.ndarray,
+    b1: np.ndarray,
+    x_value: float,
+    rng: np.random.Generator,
+    straggler_probability: float = 0.25,
+) -> WorkerResult:
+    """Simulate one worker computing A(x_i)B(x_i)."""
+    is_straggler = bool(rng.random() < straggler_probability)
+
+    base_delay = rng.uniform(0.1, 1.0)
+    delay = base_delay + rng.uniform(2.0, 4.0) if is_straggler else base_delay
+
+    encoded_a = encode_a(a0, a1, x_value)
+    encoded_b = encode_b(b0, b1, x_value)
+    value = encoded_a @ encoded_b
+
+    return WorkerResult(
+        point=x_value,
+        value=value,
+        delay=float(delay),
+        is_straggler=is_straggler,
+    )
+
+
+def interpolate_coefficients(results: list[WorkerResult]) -> np.ndarray:
+    """Recover matrix polynomial coefficients from worker evaluations.
+
+    For C(x) = C0 + C1*x + C2*x^2, each matrix entry is interpolated
+    independently. NumPy solves all entries at once by treating flattened
+    matrices as multiple right-hand sides.
+    """
+    if len(results) < 3:
+        raise ValueError("At least 3 worker results are required for decoding.")
+
+    selected = results[:3]
+    points = np.array([result.point for result in selected], dtype=float)
+
+    vandermonde = np.vander(points, N=3, increasing=True)
+    values = np.array([result.value.reshape(-1) for result in selected])
+
+    coefficients_flat = np.linalg.solve(vandermonde, values)
+    matrix_shape = selected[0].value.shape
+
+    return coefficients_flat.reshape(3, *matrix_shape)
+
+
+def decode_product(results: list[WorkerResult]) -> np.ndarray:
+    """Decode AB = C0 + C2 from the interpolated polynomial coefficients."""
+    coefficients = interpolate_coefficients(results)
+    c0 = coefficients[0]
+    c2 = coefficients[2]
+    return c0 + c2
+
+
+def run_experiment(
+    matrix_size: int,
+    n_workers: int,
+    rng: np.random.Generator,
+) -> float:
+    """Run one coded multiplication experiment and return relative error."""
+    a_matrix = rng.normal(size=(matrix_size, matrix_size))
+    b_matrix = rng.normal(size=(matrix_size, matrix_size))
+
+    a0, a1, b0, b1 = split_matrices(a_matrix, b_matrix)
+
+    points = np.arange(1, n_workers + 1, dtype=float)
+
+    results = [
+        worker_compute(a0, a1, b0, b1, x_value, rng)
+        for x_value in points
+    ]
+
+    completed = sorted(results, key=lambda item: item.delay)
+
+    decoded = decode_product(completed)
+    exact = a_matrix @ b_matrix
+
+    return float(np.linalg.norm(decoded - exact) / np.linalg.norm(exact))
+
+
+def plot_errors(worker_counts: list[int], errors: list[float], output_path: Path) -> None:
+    """Save reconstruction error plot."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(worker_counts, errors, marker="o")
+    plt.xlabel("Number of workers")
+    plt.ylabel("Relative reconstruction error")
+    plt.title("Polynomial codes: reconstruction error")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+
+
+def main() -> None:
+    rng = np.random.default_rng(seed=42)
+    matrix_size = 8
+
+    worker_counts = [3, 4, 5, 6, 7, 8]
+    errors = []
+
+    for n_workers in worker_counts:
+        error = run_experiment(matrix_size=matrix_size, n_workers=n_workers, rng=rng)
+        errors.append(error)
+        print(f"Workers: {n_workers}, relative error: {error:.3e}")
+
+    plot_errors(
+        worker_counts=worker_counts,
+        errors=errors,
+        output_path=Path("plots/reconstruction_error.png"),
+    )
+
+    print("Plot saved to plots/reconstruction_error.png")
+
+
+if __name__ == "__main__":
+    main()
